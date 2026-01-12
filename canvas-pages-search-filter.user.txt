@@ -1,136 +1,279 @@
 // ==UserScript==
-// @name         Canvas Pages: Search Bar Filter (Fast)
-// @namespace    https://tampermonkey.net/
-// @version      1.1.0
-// @description  Adds a fast search bar to Canvas Pages index and filters rows as you type.
-// @match        *://*/courses/*/pages
-// @match        *://*/courses/*/pages?*
-// @run-at       document-idle
+// @name         Canvas | All Courses | Search Bar & Term Filter
+// @version      0.0.6
+// @description  Filters courses based on user input and term selection in course list page
+// @author       Daniel Victoriano <victoriano518@gmail.com> but then Alex took it and used Claude to make some changes. Andy came up with the filtering by term.
+// @match        https://*.instructure.com/courses
 // @grant        none
 // ==/UserScript==
 
-(() => {
-  "use strict";
+(function() {
+  let rows = Array.from(document.querySelectorAll('#content table tbody tr'));
+  let header = document.querySelector('.header-bar');
 
-  const HOST_ID = "tm-pages-search-host";
-  const DEBOUNCE_INPUT_MS = 80;
-  const DEBOUNCE_MUTATION_MS = 120;
-  const TABLE_POLL_MS = 1200;
+  // Pre-process and cache searchable content
+  let rowData = rows.map(row => {
+    const termCell = row.querySelector('.course-list-term-column');
+    const termText = termCell ? termCell.textContent.trim() : '';
 
-  let lastQuery = "";
-  let tbodyObserver = null;
-  let pollTimer = null;
+    return {
+      element: row,
+      searchText: row.textContent.toLowerCase().trim(),
+      term: termText,
+      isVisible: true
+    };
+  });
 
-  // Cache: row -> searchable string
-  const rowText = new WeakMap();
-  let cachedRows = [];
+  // Create search input
+  let input = document.createElement('input');
+  input.setAttribute('type', 'text');
+  input.setAttribute('placeholder', 'Search');
+  input.setAttribute('style', 'margin-left: 10px; padding: 5px; width: 200px;');
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Create term filter dropdown
+  let termSelect = document.createElement('select');
+  termSelect.setAttribute('style', 'margin-left: 10px; padding: 5px;');
 
-  function isPagesIndex() {
-    const p = location.pathname;
-    return /\/courses\/\d+\/pages\/?$/.test(p) || /\/courses\/\d+\/pages$/.test(p);
-  }
-
-  function findPagesTable() {
-    const tables = Array.from(document.querySelectorAll("table"));
-    for (const t of tables) {
-      const thText = Array.from(t.querySelectorAll("thead th"))
-        .map((th) => (th.textContent || "").trim().toLowerCase())
-        .filter(Boolean);
-
-      const hasPageTitle = thText.some((x) => x.includes("page title") || x === "title");
-      const hasCreation = thText.some((x) => x.includes("creation") || x.includes("created"));
-      if (hasPageTitle && hasCreation) return t;
+  // Collect unique terms
+  let uniqueTerms = new Set();
+  rowData.forEach(item => {
+    if (item.term) {
+      uniqueTerms.add(item.term);
     }
+  });
 
-    return (
-      document.querySelector('[data-testid*="pages"] table') ||
-      document.querySelector("#content table") ||
-      document.querySelector(".ic-Layout-contentMain table") ||
-      null
-    );
-  }
+  // Sort terms (most recent first, with special handling)
+  let termsArray = Array.from(uniqueTerms).sort((a, b) => {
+    // Handle special cases
+    const specialTerms = ['NULL - Term', 'Non Term Associated', ''];
+    if (specialTerms.includes(a) && !specialTerms.includes(b)) return 1;
+    if (specialTerms.includes(b) && !specialTerms.includes(a)) return -1;
+    if (specialTerms.includes(a) && specialTerms.includes(b)) return 0;
 
-  function getBody(table) {
-    return (table && table.tBodies && table.tBodies[0]) ? table.tBodies[0] : null;
-  }
+    // Extract the numeric part (e.g., "1261" from "1261 - Spring 2026")
+    const getTermNumber = (term) => {
+      const match = term.match(/^(\d+)/);
+      return match ? parseInt(match[1]) : 0;
+    };
 
-  function computeRowText(tr) {
-    // textContent is much cheaper than innerText
-    return (tr.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-  }
+    return getTermNumber(b) - getTermNumber(a); // Descending order (newest first)
+  });
 
-  function indexRows(table) {
-    const tbody = getBody(table);
-    if (!tbody) {
-      cachedRows = [];
-      return;
-    }
-    cachedRows = Array.from(tbody.querySelectorAll("tr")).filter(
-      (tr) => tr.querySelectorAll("td").length > 0
-    );
+  // Add "All Terms" option
+  let allOption = document.createElement('option');
+  allOption.value = '';
+  allOption.textContent = 'All Terms';
+  termSelect.appendChild(allOption);
 
-    for (const tr of cachedRows) {
-      if (!rowText.has(tr)) rowText.set(tr, computeRowText(tr));
-    }
-  }
+  // Add term options
+  termsArray.forEach(term => {
+    let option = document.createElement('option');
+    option.value = term;
+    option.textContent = term || '(No Term)';
+    termSelect.appendChild(option);
+  });
 
-  function applyFilter(query) {
-    const q = (query || "").trim().toLowerCase();
-    lastQuery = q;
+  // Append both controls to header
+  header.appendChild(input);
+  header.appendChild(termSelect);
 
-    const total = cachedRows.length;
-    let shown = 0;
+  let timeoutId;
+  let lastQuery = '';
+  let lastTerm = '';
 
-    for (const tr of cachedRows) {
-      // If a row wasn’t cached for some reason, compute once
-      let txt = rowText.get(tr);
-      if (txt == null) {
-        txt = computeRowText(tr);
-        rowText.set(tr, txt);
+  input.addEventListener('input', function() {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      requestAnimationFrame(filterRows);
+    }, 150);
+  });
+
+  termSelect.addEventListener('change', function() {
+    requestAnimationFrame(filterRows);
+  });
+
+  function rebuildCache() {
+    rowData.forEach(item => {
+      item.searchText = item.element.textContent.toLowerCase().trim();
+      const termCell = item.element.querySelector('.course-list-term-column');
+      item.term = termCell ? termCell.textContent.trim() : '';
+    });
+
+    // Rebuild term dropdown options
+    let uniqueTerms = new Set();
+    rowData.forEach(item => {
+      if (item.term) {
+        uniqueTerms.add(item.term);
       }
-      const match = !q || txt.includes(q);
-      tr.style.display = match ? "" : "none";
-      if (match) shown++;
+    });
+
+    let termsArray = Array.from(uniqueTerms).sort((a, b) => {
+      const specialTerms = ['NULL - Term', 'Non Term Associated', ''];
+      if (specialTerms.includes(a) && !specialTerms.includes(b)) return 1;
+      if (specialTerms.includes(b) && !specialTerms.includes(a)) return -1;
+      if (specialTerms.includes(a) && specialTerms.includes(b)) return 0;
+
+      const getTermNumber = (term) => {
+        const match = term.match(/^(\d+)/);
+        return match ? parseInt(match[1]) : 0;
+      };
+
+      return getTermNumber(b) - getTermNumber(a);
+    });
+
+    // Save current selection
+    const currentSelection = termSelect.value;
+
+    // Clear and rebuild options
+    termSelect.innerHTML = '';
+    let allOption = document.createElement('option');
+    allOption.value = '';
+    allOption.textContent = 'All Terms';
+    termSelect.appendChild(allOption);
+
+    termsArray.forEach(term => {
+      let option = document.createElement('option');
+      option.value = term;
+      option.textContent = term || '(No Term)';
+      termSelect.appendChild(option);
+    });
+
+    // Restore selection if it still exists
+    if (termsArray.includes(currentSelection)) {
+      termSelect.value = currentSelection;
     }
 
-    const host = document.getElementById(HOST_ID);
-    if (host && host.shadowRoot) {
-      const countEl = host.shadowRoot.getElementById("tmCount");
-      if (countEl) countEl.textContent = `${shown} / ${total} shown`;
+    // Re-run filter with current query
+    if (input.value.trim() !== '' || termSelect.value !== '') {
+      filterRows();
     }
   }
 
-  function mountUIAbove(table) {
-    if (document.getElementById(HOST_ID)) return;
+  // Watch for teacher names being added
+  const observer = new MutationObserver((mutations) => {
+    let teacherCellsChanged = false;
 
-    const host = document.createElement("div");
-    host.id = HOST_ID;
-    const shadow = host.attachShadow({ mode: "open" });
+    for (const mutation of mutations) {
+      // Check if teacher cells were added or modified
+      if (mutation.target.classList && mutation.target.classList.contains('teacher-cell')) {
+        teacherCellsChanged = true;
+        break;
+      }
+      // Check if any added nodes are teacher cells
+      for (const node of mutation.addedNodes) {
+        if (node.classList && node.classList.contains('teacher-cell')) {
+          teacherCellsChanged = true;
+          break;
+        }
+      }
+      if (teacherCellsChanged) break;
+    }
 
-    const style = document.createElement("style");
-    style.textContent = `
-      :host{
-        display:block;
-        width: 50%;
-        min-width: 360px;
-        max-width: 640px;
+    if (teacherCellsChanged) {
+      // Debounce cache rebuilds
+      clearTimeout(observer.rebuildTimeout);
+      observer.rebuildTimeout = setTimeout(rebuildCache, 500);
+    }
+  });
+
+  // Observe all tables for teacher cell changes
+  const tables = document.querySelectorAll('#content table tbody');
+  tables.forEach(table => {
+    observer.observe(table, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+  });
+
+  function filterRows() {
+    let query = input.value.trim().toLowerCase();
+    let selectedTerm = termSelect.value;
+
+    // Skip if nothing has changed
+    if (query === lastQuery && selectedTerm === lastTerm) return;
+    lastQuery = query;
+    lastTerm = selectedTerm;
+
+    // Batch DOM operations for better performance
+    let elementsToShow = [];
+    let elementsToHide = [];
+
+    // Process in chunks to avoid blocking the main thread
+    function processChunk(startIndex) {
+      const CHUNK_SIZE = 100;
+      const endIndex = Math.min(startIndex + CHUNK_SIZE, rowData.length);
+
+      for (let i = startIndex; i < endIndex; i++) {
+        const item = rowData[i];
+
+        // Check both search query and term filter
+        const matchesSearch = query === '' || item.searchText.includes(query);
+        const matchesTerm = selectedTerm === '' || item.term === selectedTerm;
+        const shouldShow = matchesSearch && matchesTerm;
+
+        if (shouldShow !== item.isVisible) {
+          item.isVisible = shouldShow;
+          if (shouldShow) {
+            elementsToShow.push(item.element);
+          } else {
+            elementsToHide.push(item.element);
+          }
+        }
       }
-      @media (max-width: 900px){
-        :host{ width: 100%; min-width: 0; max-width: 100%; }
+
+      // If there are more items, schedule the next chunk
+      if (endIndex < rowData.length) {
+        requestAnimationFrame(() => processChunk(endIndex));
+      } else {
+        // Apply all DOM changes at once
+        applyChanges();
       }
-      .wrap{
-        display:flex;
-        align-items:center;
-        gap:10px;
-        padding:10px 12px;
-        border:1px solid rgba(0,0,0,.12);
-        border-radius:10px;
-        background:#fff;
-        margin: 0 0 12px 0;
-      }
-      .row{
-        display:flex;
-        align-items:center;
-        gap:8px;
+    }
+
+    function applyChanges() {
+      // Batch show operations
+      elementsToShow.forEach(el => {
+        el.style.display = '';
+      });
+
+      // Batch hide operations
+      elementsToHide.forEach(el => {
+        el.style.display = 'none';
+      });
+
+      // Optional: Update a counter or status
+      updateResultsCount();
+    }
+
+    function updateResultsCount() {
+      // Optional: Show "X of Y courses" somewhere
+      const visibleCount = rowData.filter(item => item.isVisible).length;
+      console.log(`Showing ${visibleCount} of ${rowData.length} courses`);
+    }
+
+    // Start processing
+    processChunk(0);
+  }
+
+  // Clear search with Escape when focused
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+      this.value = '';
+      filterRows();
+    }
+  });
+
+  // Optimization: If user is typing rapidly, increase debounce
+  let rapidTypingCount = 0;
+  input.addEventListener('input', function() {
+    rapidTypingCount++;
+    setTimeout(() => rapidTypingCount--, 1000);
+
+    clearTimeout(timeoutId);
+    const debounceTime = rapidTypingCount > 5 ? 300 : 150;
+    timeoutId = setTimeout(() => {
+      requestAnimationFrame(filterRows);
+    }, debounceTime);
+  });
+})();
