@@ -1,0 +1,199 @@
+// ==UserScript==
+// @name         Canvas – Ally Score column (no collisions, stable width)
+// @namespace    https://github.com/redice44
+// @author andy hernandez
+// @version      1.0.3
+// @description  Adds a stable Ally Score column in the non-sticky region with colgroup width + overflow fixes (prevents header overlap).
+// @match        https://fiu.instructure.com/courses
+// @run-at       document-idle
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const ALLY_TOOL_ID = '149770';
+
+  // Insert Ally Score after this column (must be left of the sticky-right group).
+  // Works well: 'teacher' (as in your screenshots)
+  const INSERT_AFTER = 'teacher';
+
+  // Column width to prevent the header overlap you’re seeing
+  const ALLY_COL_WIDTH_PX = 160;
+
+  const courseTables = ['#my_courses_table', '#past_enrollments_table', '#future_enrollments_table'];
+
+  const $  = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+
+  GM_addStyle(`
+    /* Make our header/cells behave like a real table column and not “paint over neighbors” */
+    th[data-ally-col="1"], td.ally-score-td {
+      width: ${ALLY_COL_WIDTH_PX}px !important;
+      min-width: ${ALLY_COL_WIDTH_PX}px !important;
+      max-width: ${ALLY_COL_WIDTH_PX}px !important;
+      white-space: nowrap !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      box-sizing: border-box !important;
+      vertical-align: middle;
+    }
+
+    th[data-ally-col="1"] {
+      position: relative;   /* avoid weird overlay behavior */
+      z-index: 0;
+    }
+
+    .ally-score-cell {
+      display:flex;
+      align-items:center;
+      gap:.35rem;
+      font-weight: 600;
+      overflow:hidden;
+      text-overflow: ellipsis;
+    }
+
+    .ally-score-cell a,
+    .ally-score-cell a:link,
+    .ally-score-cell a:visited,
+    .ally-score-cell a:hover,
+    .ally-score-cell a:active {
+      color:#2b2b2b !important;
+      text-decoration: underline;
+      overflow:hidden;
+      text-overflow: ellipsis;
+    }
+  `);
+
+  function norm(s) {
+    return (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function headerIndexStartsWith(table, startsWithLower) {
+    const ths = Array.from(table.querySelectorAll('thead th'));
+    return ths.findIndex(th => norm(th.textContent).startsWith(startsWithLower));
+  }
+
+  function extractCourseIdFromRow(tr) {
+    const a = tr.querySelector('a[href*="/courses/"]');
+    const href = a?.getAttribute('href') || '';
+    const m = href.match(/\/courses\/(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  function ensureColGroupSlot(table, insertAfterIdx) {
+    // If Canvas has a colgroup, add a <col> so the browser allocates width properly.
+    const colgroup = table.querySelector('colgroup');
+    if (!colgroup) return;
+
+    // If we already have our col, bail.
+    if (colgroup.querySelector('col[data-ally-col="1"]')) return;
+
+    const cols = Array.from(colgroup.querySelectorAll('col'));
+    const newCol = document.createElement('col');
+    newCol.setAttribute('data-ally-col', '1');
+    newCol.style.width = `${ALLY_COL_WIDTH_PX}px`;
+
+    // Insert after the col that corresponds to insertAfterIdx (if it exists)
+    const ref = cols[insertAfterIdx];
+    if (ref && ref.nextSibling) {
+      colgroup.insertBefore(newCol, ref.nextSibling);
+    } else if (ref) {
+      colgroup.appendChild(newCol);
+    } else {
+      // fallback if col count doesn’t match header count
+      colgroup.appendChild(newCol);
+    }
+  }
+
+  function ensureAllyColumn(table) {
+    // idempotent
+    if (table.querySelector('thead th[data-ally-col="1"]')) return;
+
+    const afterIdx = headerIndexStartsWith(table, INSERT_AFTER);
+    if (afterIdx < 0) return;
+
+    const headerRow = table.tHead?.rows?.[0];
+    if (!headerRow) return;
+
+    // Ensure colgroup width slot FIRST (prevents header overlap)
+    ensureColGroupSlot(table, afterIdx);
+
+    // Header
+    const th = document.createElement('th');
+    th.textContent = 'Ally Score';
+    th.setAttribute('data-ally-col', '1');
+    th.style.width = `${ALLY_COL_WIDTH_PX}px`;
+
+    headerRow.cells[afterIdx].after(th);
+
+    // Body cells
+    const rows = Array.from(table.tBodies?.[0]?.rows || []);
+    for (const tr of rows) {
+      if (!tr.cells || !tr.cells[afterIdx]) continue;
+
+      const td = document.createElement('td');
+      td.className = 'ally-score-td';
+      td.innerHTML = `<div class="ally-score-cell">—</div>`;
+      td.style.width = `${ALLY_COL_WIDTH_PX}px`;
+
+      tr.cells[afterIdx].after(td);
+    }
+  }
+
+  function getAllyColumnIndex(table) {
+    const ths = Array.from(table.querySelectorAll('thead th'));
+    return ths.findIndex(th => th.getAttribute('data-ally-col') === '1');
+  }
+
+  function renderLink(tr, allyIdx, courseId) {
+    const td = tr.cells?.[allyIdx];
+    if (!td) return;
+
+    if (!courseId) {
+      td.innerHTML = `<div class="ally-score-cell">—</div>`;
+      return;
+    }
+
+    const href = `${location.origin}/courses/${courseId}/external_tools/${ALLY_TOOL_ID}`;
+    // Always render a non-empty cell so the browser gives the column width
+    td.innerHTML = `<div class="ally-score-cell"><a href="${href}" target="_blank" rel="noopener noreferrer">Ally Score</a></div>`;
+  }
+
+  function observeTable(table) {
+    const mo = new MutationObserver(() => {
+      try {
+        ensureAllyColumn(table);
+      } catch {}
+    });
+    mo.observe(table, { childList: true, subtree: true });
+  }
+
+  async function processTable(selector) {
+    const table = $(selector);
+    if (!table) return;
+
+    ensureAllyColumn(table);
+    observeTable(table);
+
+    const allyIdx = getAllyColumnIndex(table);
+    if (allyIdx < 0) return;
+
+    const rows = $$('tbody tr', table).filter(tr => tr.querySelector('td'));
+    for (const tr of rows) {
+      const courseId = extractCourseIdFromRow(tr);
+      renderLink(tr, allyIdx, courseId);
+    }
+  }
+
+  async function main() {
+    // Wait for Canvas to render tables
+    for (let i = 0; i < 30; i++) {
+      if (courseTables.some(s => $(s))) break;
+      await new Promise(r => setTimeout(r, 120));
+    }
+    await Promise.all(courseTables.map(processTable));
+  }
+
+  main();
+})();
