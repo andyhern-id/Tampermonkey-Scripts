@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Canvas Bulk Item Actions (clean inline actions)
+// @name         Canvas Bulk Item Actions (clean toolbar)
 // @namespace    https://tampermonkey.net/
-// @version      1.1.0
-// @description  Bulk actions for Canvas module items with inline action pills, select all, unselect all, safe remove, and duplicate disabled for unsupported item types.
+// @version      1.0.0
+// @description  Bulk actions for Canvas module items with inline toolbar, select all, reliable duplicate/indent/remove.
 // @match        https://*/courses/*/modules*
 // @match        http://*/courses/*/modules*
 // @grant        none
@@ -13,34 +13,40 @@
 
   const CONFIG = {
     debug: false,
-    actionDelayMs: 250
+    actionDelayMs: 180
   };
 
   const SEL = {
     module: '.context_module.item-group-condensed',
-    moduleHeader: '.ig-header.header',
+    content: '.content',
+    itemList: 'ul.context_module_items.manageable, ul.ig-list.items.context_module_items',
     item: 'li.context_module_item',
     itemRow: '.ig-row',
+    itemTitle: '.module-item-title .item_name .title, .module-item-title .item_name a, .module-item-title .title',
     itemMenu: '.cog-menu-container .al-options',
-    itemKebab: '.cog-menu-container .al-trigger',
-    itemTitle: '.module-item-title .item_name .title, .module-item-title .item_name a, .module-item-title .title'
+    itemType: '.module_item_icons .type',
+    itemUrl: '.module-item-title .url',
+    itemNewTab: '.module-item-title .new_tab'
   };
 
   const CLASSES = {
     checkboxCell: 'tm-bulk-checkbox-cell',
     checkbox: 'tm-bulk-checkbox',
     selectedRow: 'tm-bulk-selected-row',
-    actions: 'tm-bulk-actions',
-    actionButton: 'tm-bulk-action-btn',
-    actionDanger: 'tm-bulk-action-btn-danger',
-    actionCount: 'tm-bulk-action-count'
+    toolbarWrap: 'tm-bulk-toolbar-wrap',
+    toolbar: 'tm-bulk-toolbar',
+    button: 'tm-bulk-button',
+    buttonDanger: 'tm-bulk-button-danger',
+    buttonDisabled: 'tm-bulk-button-disabled',
+    count: 'tm-bulk-count',
+    hidden: 'tm-bulk-hidden'
   };
 
   const ACTIONS = [
-    { key: 'duplicate', label: 'Duplicate', selector: 'a.duplicate_item_link', mode: 'duplicate' },
-    { key: 'outdent', label: 'Decrease indent', selector: 'a.outdent_item_link', mode: 'indent' },
-    { key: 'indent', label: 'Increase indent', selector: 'a.indent_item_link', mode: 'indent' },
-    { key: 'remove', label: 'Remove', selector: 'a.delete_item_link', mode: 'remove', danger: true }
+    { key: 'duplicate', selector: 'a.duplicate_item_link', mode: 'duplicate', label: 'Duplicate' },
+    { key: 'outdent', selector: 'a.outdent_item_link', mode: 'indent', label: 'Decrease indent' },
+    { key: 'indent', selector: 'a.indent_item_link', mode: 'indent', label: 'Increase indent' },
+    { key: 'remove', selector: 'a.delete_item_link', mode: 'remove', label: 'Remove' }
   ];
 
   function log(...args) {
@@ -95,10 +101,33 @@
     return (el?.textContent || 'Untitled item').replace(/\s+/g, ' ').trim();
   }
 
+  function getItemType(itemEl) {
+    const hiddenType = ($(SEL.itemType, itemEl)?.textContent || '').trim();
+    if (hiddenType) return hiddenType;
+
+    const classes = itemEl.classList;
+    if (classes.contains('context_module_sub_header')) return 'context_module_sub_header';
+    if (classes.contains('external_url')) return 'external_url';
+    if (classes.contains('quiz')) return 'quiz';
+    if (classes.contains('discussion_topic')) return 'discussion_topic';
+    if (classes.contains('wiki_page')) return 'wiki_page';
+    if (classes.contains('assignment')) return 'assignment';
+    if (classes.contains('attachment')) return 'attachment';
+    return '';
+  }
+
+  function getItemUrl(itemEl) {
+    return ($(SEL.itemUrl, itemEl)?.textContent || '').trim();
+  }
+
+  function getItemNewTab(itemEl) {
+    return ($(SEL.itemNewTab, itemEl)?.textContent || '').trim() === '1';
+  }
+
   function getSelectedItems(moduleEl) {
     return getVisibleItems(moduleEl).filter(item => {
       const cb = item.querySelector(`.${CLASSES.checkbox}`);
-      return cb?.checked;
+      return !!cb?.checked;
     });
   }
 
@@ -106,18 +135,15 @@
     return itemEl.querySelector(`${SEL.itemMenu} ${selector}`);
   }
 
-  function clickNative(el) {
-    if (!el) return;
-    el.click();
-  }
-
-  async function waitUntil(fn, timeoutMs = 3000, intervalMs = 100) {
-    const end = Date.now() + timeoutMs;
-    while (Date.now() < end) {
-      if (fn()) return true;
-      await sleep(intervalMs);
-    }
-    return false;
+  function waitUntil(fn, timeoutMs = 2500, intervalMs = 100) {
+    return new Promise(resolve => {
+      const end = Date.now() + timeoutMs;
+      (function check() {
+        if (fn()) return resolve(true);
+        if (Date.now() >= end) return resolve(false);
+        setTimeout(check, intervalMs);
+      })();
+    });
   }
 
   function getIndentLevel(itemEl) {
@@ -125,48 +151,36 @@
     return match ? Number(match[1]) : 0;
   }
 
+  function setIndentLevelInDom(itemEl, level) {
+    itemEl.className = itemEl.className.replace(/\bindent_\d+\b/g, '').replace(/\s+/g, ' ').trim();
+    itemEl.classList.add(`indent_${level}`);
+  }
+
   function canOutdent(itemEl) {
     return getIndentLevel(itemEl) > 0;
   }
 
   function canIndent(itemEl) {
-    return getIndentLevel(itemEl) < 3;
+    return getIndentLevel(itemEl) < 4;
   }
 
-  function getItemType(itemEl) {
-    const hiddenType = itemEl.querySelector('.module_item_icons .type')?.textContent?.trim() || '';
-
-    if (itemEl.classList.contains('external_url')) return 'external_url';
-    if (itemEl.classList.contains('context_module_sub_header')) return 'context_module_sub_header';
-    if (itemEl.classList.contains('sub_header')) return 'context_module_sub_header';
-    if (itemEl.classList.contains('quiz')) return 'quiz';
-
-    if (hiddenType) return hiddenType;
-    return '';
-  }
-
-  function isDuplicateBlockedType(itemEl) {
+  function canDuplicate(itemEl) {
     const type = getItemType(itemEl);
-    return type === 'quiz' ||
-           type === 'external_url' ||
-           type === 'context_module_sub_header';
+    if (type === 'quiz' || type === 'external_url' || type === 'context_module_sub_header') return false;
+    return !!getSourceAnchor(itemEl, 'a.duplicate_item_link');
   }
 
   function isActionAvailable(itemEl, action) {
-    if (action.key === 'duplicate' && isDuplicateBlockedType(itemEl)) return false;
-    if (action.key === 'outdent' && !canOutdent(itemEl)) return false;
-    if (action.key === 'indent' && !canIndent(itemEl)) return false;
+    if (action.key === 'duplicate') return canDuplicate(itemEl);
+    if (action.key === 'outdent') return canOutdent(itemEl) && !!getSourceAnchor(itemEl, action.selector);
+    if (action.key === 'indent') return canIndent(itemEl) && !!getSourceAnchor(itemEl, action.selector);
+    if (action.key === 'remove') return !!getSourceAnchor(itemEl, action.selector);
+    return false;
+  }
 
-    const a = getSourceAnchor(itemEl, action.selector);
-    if (!a) return false;
-
-    const li = a.closest('li');
-    if (!li) return false;
-    if (li.hidden) return false;
-    if (li.classList.contains('hidden')) return false;
-    if (li.style.display === 'none') return false;
-
-    return true;
+  function getCommonActions(selectedItems) {
+    if (!selectedItems.length) return [];
+    return ACTIONS.filter(action => selectedItems.every(item => isActionAvailable(item, action)));
   }
 
   function getCSRFToken() {
@@ -177,129 +191,131 @@
     );
   }
 
-  async function requestWithCSRF(url, method) {
+  async function requestWithCSRF(url, method, body = null, extraHeaders = {}) {
     const token = getCSRFToken();
+
+    const headers = {
+      'X-CSRF-Token': token,
+      'X-Requested-With': 'XMLHttpRequest',
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      ...extraHeaders
+    };
+
     const res = await fetch(url, {
       method,
       credentials: 'same-origin',
-      headers: {
-        'X-CSRF-Token': token,
-        'X-Requested-With': 'XMLHttpRequest',
-        'Accept': 'application/json, text/javascript, */*; q=0.01'
-      }
+      headers,
+      body
     });
-    if (!res.ok) throw new Error(`${method} failed (${res.status})`);
+
+    if (!res.ok) {
+      throw new Error(`${method} failed (${res.status})`);
+    }
+
     return res;
   }
 
-  function isSafeModuleItemUrl(url) {
-    try {
-      const parsed = new URL(url, window.location.origin);
-      return /\/courses\/\d+\/modules\/items\/\d+(?:$|[/?#])/.test(parsed.pathname);
-    } catch {
-      return false;
-    }
+  async function duplicateItemRequest(url) {
+    await requestWithCSRF(url, 'POST');
   }
 
-  async function removeItemFallback(url) {
-    if (!isSafeModuleItemUrl(url)) {
-      throw new Error('Refusing unsafe remove URL');
-    }
+  async function removeItemRequest(url) {
     await requestWithCSRF(url, 'DELETE');
   }
 
-  async function openItemMenu(itemEl) {
-    const kebab = itemEl.querySelector(SEL.itemKebab);
-    if (!kebab) throw new Error(`No item menu trigger for "${getItemTitle(itemEl)}"`);
-    clickNative(kebab);
-    await sleep(80);
-  }
+  async function updateIndentRequest(itemEl, url, newIndent) {
+    const token = getCSRFToken();
+    const body = new URLSearchParams();
 
-  async function runIndentAction(itemEl, selector) {
-    const beforeIndent = getIndentLevel(itemEl);
-    await openItemMenu(itemEl);
+    body.set('utf8', '✓');
+    body.set('_method', 'put');
+    body.set('authenticity_token', token);
+    body.set('content_tag[title]', getItemTitle(itemEl));
+    body.set('content_tag[indent]', String(newIndent));
 
-    const actionAnchor = getSourceAnchor(itemEl, selector);
-    if (!actionAnchor) throw new Error(`Missing indent action for "${getItemTitle(itemEl)}"`);
-
-    clickNative(actionAnchor);
-
-    const changed = await waitUntil(() => {
-      if (!document.contains(itemEl)) return false;
-      return getIndentLevel(itemEl) !== beforeIndent;
-    }, 3000, 100);
-
-    return { reload: !changed };
-  }
-
-  async function runRemoveAction(itemEl, moduleEl, selector) {
-    const actionTitle = getItemTitle(itemEl);
-    await openItemMenu(itemEl);
-
-    const actionAnchor = getSourceAnchor(itemEl, selector);
-    if (!actionAnchor) throw new Error(`Missing remove action for "${actionTitle}"`);
-
-    const removeUrl = actionAnchor.href;
-    if (!isSafeModuleItemUrl(removeUrl)) {
-      throw new Error(`Refusing unsafe remove target for "${actionTitle}"`);
+    const itemUrl = getItemUrl(itemEl);
+    if (itemUrl) {
+      body.set('content_tag[url]', itemUrl);
+      body.set('content_tag[new_tab]', getItemNewTab(itemEl) ? '1' : '0');
     }
 
-    await removeItemFallback(removeUrl);
+    await requestWithCSRF(
+      url,
+      'POST',
+      body.toString(),
+      { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }
+    );
+  }
+
+  async function runDuplicateAction(itemEl) {
+    const anchor = getSourceAnchor(itemEl, 'a.duplicate_item_link');
+    if (!anchor) throw new Error(`Missing duplicate action for "${getItemTitle(itemEl)}"`);
+
+    await duplicateItemRequest(anchor.href);
+    return { reload: true };
+  }
+
+  async function runRemoveAction(itemEl) {
+    const anchor = getSourceAnchor(itemEl, 'a.delete_item_link');
+    if (!anchor) throw new Error(`Missing remove action for "${getItemTitle(itemEl)}"`);
+
+    await removeItemRequest(anchor.href);
 
     const row = getItemRow(itemEl);
-    if (row) row.remove();
-    else itemEl.remove();
+    if (row) row.classList.remove(CLASSES.selectedRow);
+    itemEl.remove();
 
     return { reload: false };
   }
 
-  async function runDuplicateAction(itemEl, moduleEl, selector) {
-    const beforeCount = getVisibleItems(moduleEl).length;
-    await openItemMenu(itemEl);
+  async function runIndentAction(itemEl, selector) {
+    const anchor = getSourceAnchor(itemEl, selector);
+    if (!anchor) throw new Error(`Missing indent action for "${getItemTitle(itemEl)}"`);
 
-    const actionAnchor = getSourceAnchor(itemEl, selector);
-    if (!actionAnchor) throw new Error(`Missing duplicate action for "${getItemTitle(itemEl)}"`);
+    const current = getIndentLevel(itemEl);
+    const next = selector.includes('outdent') ? Math.max(0, current - 1) : Math.min(3, current + 1);
 
-    clickNative(actionAnchor);
+    if (next === current) return { reload: false };
 
-    await waitUntil(() => {
-      return getVisibleItems(moduleEl).length > beforeCount;
-    }, 4000, 100);
+    await updateIndentRequest(itemEl, anchor.href, next);
+    setIndentLevelInDom(itemEl, next);
 
-    return { reload: true };
+    return { reload: false };
   }
 
-  async function runNativeAction(itemEl, moduleEl, action) {
+  async function runNativeAction(itemEl, action) {
     switch (action.mode) {
+      case 'duplicate':
+        return runDuplicateAction(itemEl);
+      case 'remove':
+        return runRemoveAction(itemEl);
       case 'indent':
         return runIndentAction(itemEl, action.selector);
-      case 'remove':
-        return runRemoveAction(itemEl, moduleEl, action.selector);
-      case 'duplicate':
-        return runDuplicateAction(itemEl, moduleEl, action.selector);
       default:
         throw new Error(`Unknown action mode: ${action.mode}`);
     }
   }
 
-  async function runBulkAction(moduleEl, action) {
+  async function runBulkAction(moduleEl, actionKey) {
+    const action = ACTIONS.find(a => a.key === actionKey);
+    if (!action) return;
+
     const items = getSelectedItems(moduleEl);
     if (!items.length) return;
+
+    if (!items.every(item => isActionAvailable(item, action))) return;
+
+    if (action.key === 'remove') {
+      const ok = confirm(`Remove ${items.length} selected item(s) from this module?\n\nThis should only remove them from the module, not delete the underlying course content.`);
+      if (!ok) return;
+    }
 
     const failures = [];
     let shouldReload = false;
 
-    if (action.key === 'remove') {
-      const ok = confirm(
-        `Remove ${items.length} selected item(s) from this module only?\n\n` +
-        `This will NOT delete the underlying content from the course.`
-      );
-      if (!ok) return;
-    }
-
-    for (const itemEl of items) {
+    for (const itemEl of [...items]) {
       try {
-        const result = await runNativeAction(itemEl, moduleEl, action);
+        const result = await runNativeAction(itemEl, action);
         if (result?.reload) shouldReload = true;
       } catch (err) {
         console.error(err);
@@ -311,37 +327,16 @@
 
     refreshUI();
 
-    if (shouldReload) {
-      window.location.reload();
-      return;
-    }
-
     if (failures.length) {
       alert(
         `Finished with ${failures.length} issue(s):\n\n` +
         failures.map(x => `• ${x}`).join('\n')
       );
     }
-  }
 
-  function clearSelections(moduleEl) {
-    getVisibleItems(moduleEl).forEach(itemEl => {
-      const cb = itemEl.querySelector(`.${CLASSES.checkbox}`);
-      const row = getItemRow(itemEl);
-      if (cb) cb.checked = false;
-      if (row) row.classList.remove(CLASSES.selectedRow);
-    });
-    updateModuleUI(moduleEl);
-  }
-
-  function selectAllItems(moduleEl) {
-    getVisibleItems(moduleEl).forEach(itemEl => {
-      const cb = itemEl.querySelector(`.${CLASSES.checkbox}`);
-      const row = getItemRow(itemEl);
-      if (cb) cb.checked = true;
-      if (row) row.classList.add(CLASSES.selectedRow);
-    });
-    updateModuleUI(moduleEl);
+    if (shouldReload) {
+      window.location.reload();
+    }
   }
 
   function injectStyles() {
@@ -350,11 +345,6 @@
     const style = document.createElement('style');
     style.id = 'tm-bulk-style';
     style.textContent = `
-      .context_module .ig-header.header {
-        flex-wrap: wrap !important;
-        overflow: visible !important;
-      }
-
       .${CLASSES.checkboxCell} {
         width: 26px;
         min-width: 26px;
@@ -367,90 +357,78 @@
       }
 
       .${CLASSES.checkbox} {
-        width: 18px;
-        height: 18px;
+        width: 15px;
+        height: 15px;
         margin: 0;
         cursor: pointer;
       }
 
       .context_module_item .ig-row.${CLASSES.selectedRow} {
-        background: rgba(17,45,84,0.06) !important;
-        box-shadow: inset 4px 0 0 #0f9d58;
+        background: rgba(17,45,84,0.05) !important;
+        box-shadow: inset 4px 0 0 #08a650;
       }
 
-      .${CLASSES.actions} {
-        display: none;
-        position: relative;
-        align-items: center;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-        gap: 10px;
-        flex: 0 0 100%;
-        width: 100%;
-        order: 999;
-        margin-top: 10px;
-        padding-top: 10px;
-        padding-right: 8px;
-        border-top: none;
-        overflow: visible;
-        box-sizing: border-box;
-      }
-
-      .${CLASSES.actions}::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: -6px;
-        right: -6px;
+      .${CLASSES.toolbarWrap} {
+        margin: 0 10px 0 6px;
+        padding: 12px 0 10px;
         border-top: 1px solid #c7cdd1;
-        pointer-events: none;
       }
 
-      .${CLASSES.actionButton},
-      .${CLASSES.actionCount} {
-        display: inline-flex;
+      .${CLASSES.toolbar} {
+        display: flex;
+        justify-content: flex-end;
         align-items: center;
-        justify-content: center;
-        min-height: 34px;
-        padding: 0 16px;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .${CLASSES.button} {
+        appearance: none;
         border: 1px solid #c7cdd1;
-        border-radius: 999px;
         background: #fff;
         color: #2d3b45;
+        border-radius: 999px;
+        min-height: 38px;
+        padding: 0 16px;
         font-size: 14px;
         line-height: 1;
-        white-space: nowrap;
+        cursor: pointer;
         box-sizing: border-box;
       }
 
-      .${CLASSES.actionButton} {
-        cursor: pointer;
-      }
-
-      .${CLASSES.actionButton}:hover:not(:disabled) {
-        background: #f5f7fa;
-      }
-
-      .${CLASSES.actionButton}:disabled {
-        color: #9aa5ad;
+      .${CLASSES.button}:hover:not(.${CLASSES.buttonDisabled}) {
         background: #f8f9fa;
-        border-color: #d8dde1;
-        cursor: not-allowed;
-        opacity: 1;
       }
 
-      .${CLASSES.actionButton}.${CLASSES.actionDanger} {
-        border-color: #d7b7b7;
-        color: #6b2c2c;
+      .${CLASSES.buttonDanger} {
+        border-color: #d9b8b8;
+        color: #8a3c38;
       }
 
-      .${CLASSES.actionButton}.${CLASSES.actionDanger}:hover:not(:disabled) {
-        background: #fff7f7;
+      .${CLASSES.buttonDisabled} {
+        background: #f8f9fa !important;
+        color: #9aa4af !important;
+        border-color: #d8dde3 !important;
+        cursor: not-allowed !important;
       }
 
-      .${CLASSES.actionCount} {
-        background: #f5f7fa;
-        cursor: default;
+      .${CLASSES.count} {
+        display: inline-flex;
+        align-items: center;
+        border: 1px solid #c7cdd1;
+        background: #fff;
+        color: #2d3b45;
+        border-radius: 999px;
+        min-height: 38px;
+        padding: 0 16px;
+        font-size: 14px;
+        line-height: 1;
+        box-sizing: border-box;
+        white-space: nowrap;
+      }
+
+      .${CLASSES.hidden} {
+        display: none !important;
       }
     `;
     document.head.appendChild(style);
@@ -473,14 +451,10 @@
     cb.className = CLASSES.checkbox;
     cb.title = `Select ${getItemTitle(itemEl)}`;
 
-    cb.addEventListener('click', (e) => {
-      e.stopPropagation();
-    });
-
     cb.addEventListener('change', () => {
       row.classList.toggle(CLASSES.selectedRow, cb.checked);
       const moduleEl = itemEl.closest(SEL.module);
-      if (moduleEl) updateModuleUI(moduleEl);
+      if (moduleEl) updateToolbarState(moduleEl);
     });
 
     cell.appendChild(cb);
@@ -492,103 +466,123 @@
     }
   }
 
-  function ensureActionBar(moduleEl) {
-    const header = $(SEL.moduleHeader, moduleEl);
-    if (!header) return null;
-
-    let bar = header.querySelector(`.${CLASSES.actions}`);
-    if (!bar) {
-      bar = document.createElement('div');
-      bar.className = CLASSES.actions;
-      header.appendChild(bar);
-    }
-    return bar;
+  function setItemChecked(itemEl, checked) {
+    const cb = itemEl.querySelector(`.${CLASSES.checkbox}`);
+    const row = getItemRow(itemEl);
+    if (!cb || !row) return;
+    cb.checked = checked;
+    row.classList.toggle(CLASSES.selectedRow, checked);
   }
 
-  function makeActionButton(label, onClick, options = {}) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = CLASSES.actionButton;
-    btn.textContent = label;
+  function clearSelections(moduleEl) {
+    getVisibleItems(moduleEl).forEach(item => setItemChecked(item, false));
+    updateToolbarState(moduleEl);
+  }
 
-    if (options.danger) {
-      btn.classList.add(CLASSES.actionDanger);
-    }
+  function selectAllItems(moduleEl) {
+    getVisibleItems(moduleEl).forEach(item => setItemChecked(item, true));
+    updateToolbarState(moduleEl);
+  }
 
-    if (options.disabled) {
-      btn.disabled = true;
-      btn.setAttribute('aria-disabled', 'true');
-      if (options.title) btn.title = options.title;
+  function ensureToolbar(moduleEl) {
+    const content = $(SEL.content, moduleEl);
+    const list = $(SEL.itemList, moduleEl);
+    if (!content || !list) return null;
+
+    let wrap = content.querySelector(`.${CLASSES.toolbarWrap}`);
+    if (wrap) return wrap;
+
+    wrap = document.createElement('div');
+    wrap.className = `${CLASSES.toolbarWrap} ${CLASSES.hidden}`;
+
+    const toolbar = document.createElement('div');
+    toolbar.className = CLASSES.toolbar;
+    toolbar.setAttribute('role', 'toolbar');
+    toolbar.setAttribute('aria-label', 'Bulk item actions');
+
+    const makeButton = (label, attrs = {}) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = CLASSES.button;
+      btn.textContent = label;
+      Object.entries(attrs).forEach(([k, v]) => btn.setAttribute(k, v));
       return btn;
-    }
+    };
 
-    btn.addEventListener('click', onClick);
-    return btn;
-  }
+    const selectAllBtn = makeButton('Select All', { 'data-bulk-control': 'select-all' });
+    selectAllBtn.addEventListener('click', () => selectAllItems(moduleEl));
 
-  function renderActionBar(moduleEl) {
-    const bar = ensureActionBar(moduleEl);
-    if (!bar) return;
+    toolbar.appendChild(selectAllBtn);
 
-    const selectedItems = getSelectedItems(moduleEl);
+    ACTIONS.forEach(action => {
+      const btn = makeButton(action.label, { 'data-bulk-action': action.key });
+      if (action.key === 'remove') btn.classList.add(CLASSES.buttonDanger);
 
-    if (!selectedItems.length) {
-      bar.innerHTML = '';
-      bar.style.display = 'none';
-      return;
-    }
+      btn.addEventListener('click', () => {
+        if (btn.disabled) return;
+        runBulkAction(moduleEl, action.key);
+      });
 
-    bar.innerHTML = '';
-    bar.style.display = 'flex';
-
-    const selectAllBtn = makeActionButton('Select All', () => {
-      selectAllItems(moduleEl);
+      toolbar.appendChild(btn);
     });
-    bar.appendChild(selectAllBtn);
 
-    for (const action of ACTIONS) {
-      const enabled = selectedItems.every(item => isActionAvailable(item, action));
-
-      let disabledTitle = '';
-      if (action.key === 'duplicate' && !enabled) {
-        disabledTitle = 'Duplicate is unavailable when the selection includes quizzes, text headers, external URLs, or other unsupported items.';
-      }
-
-      const btn = makeActionButton(
-        action.label,
-        async () => {
-          await runBulkAction(moduleEl, action);
-        },
-        {
-          disabled: !enabled,
-          danger: !!action.danger,
-          title: disabledTitle
-        }
-      );
-
-      bar.appendChild(btn);
-    }
-
-    const unselectBtn = makeActionButton('Unselect All', () => {
-      clearSelections(moduleEl);
-    });
-    bar.appendChild(unselectBtn);
+    const clearBtn = makeButton('Unselect All', { 'data-bulk-control': 'clear' });
+    clearBtn.addEventListener('click', () => clearSelections(moduleEl));
+    toolbar.appendChild(clearBtn);
 
     const count = document.createElement('span');
-    count.className = CLASSES.actionCount;
-    count.textContent = `${selectedItems.length} selected`;
-    bar.appendChild(count);
+    count.className = CLASSES.count;
+    toolbar.appendChild(count);
+
+    wrap.appendChild(toolbar);
+    content.insertBefore(wrap, list);
+
+    return wrap;
   }
 
-  function updateModuleUI(moduleEl) {
-    renderActionBar(moduleEl);
+  function updateToolbarState(moduleEl) {
+    const wrap = ensureToolbar(moduleEl);
+    if (!wrap) return;
+
+    const selectedItems = getSelectedItems(moduleEl);
+    const count = selectedItems.length;
+    const totalItems = getVisibleItems(moduleEl).length;
+    const commonActions = getCommonActions(selectedItems);
+
+    wrap.classList.toggle(CLASSES.hidden, count === 0);
+
+    const countEl = wrap.querySelector(`.${CLASSES.count}`);
+    const clearBtn = wrap.querySelector('[data-bulk-control="clear"]');
+    const selectAllBtn = wrap.querySelector('[data-bulk-control="select-all"]');
+
+    if (countEl) {
+      countEl.textContent = `${count} selected`;
+    }
+
+    if (clearBtn) {
+      clearBtn.classList.toggle(CLASSES.hidden, count === 0);
+    }
+
+    if (selectAllBtn) {
+      const hideSelectAll = count === 0 || totalItems === 0 || count === totalItems;
+      selectAllBtn.classList.toggle(CLASSES.hidden, hideSelectAll);
+      selectAllBtn.disabled = hideSelectAll;
+      selectAllBtn.classList.toggle(CLASSES.buttonDisabled, selectAllBtn.disabled);
+    }
+
+    wrap.querySelectorAll('[data-bulk-action]').forEach(btn => {
+      const action = ACTIONS.find(a => a.key === btn.dataset.bulkAction);
+      const enabled = count > 0 && commonActions.some(a => a.key === action.key);
+      btn.disabled = !enabled;
+      btn.classList.toggle(CLASSES.buttonDisabled, !enabled);
+    });
   }
 
   function refreshUI() {
     getVisibleModules().forEach(moduleEl => {
       getVisibleItems(moduleEl).forEach(ensureCheckbox);
-      ensureActionBar(moduleEl);
-      updateModuleUI(moduleEl);
+      ensureToolbar(moduleEl);
+      updateToolbarState(moduleEl);
     });
   }
 
@@ -598,7 +592,7 @@
 
     const observer = new MutationObserver(debounce(() => {
       refreshUI();
-    }, 150));
+    }, 120));
 
     observer.observe(document.body, {
       childList: true,
