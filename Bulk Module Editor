@@ -1,0 +1,605 @@
+// ==UserScript==
+// @name         Canvas Bulk Item Actions (clean inline actions)
+// @namespace    https://tampermonkey.net/
+// @version      1.0.1
+// @author       Andy Hernandez
+// @description  Bulk actions for Canvas module items with inline action pills, unselect all, safe remove, and duplicate disabled for unsupported item types.
+// @match        https://*/courses/*/modules*
+// @match        http://*/courses/*/modules*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const CONFIG = {
+    debug: false,
+    actionDelayMs: 250
+  };
+
+  const SEL = {
+    module: '.context_module.item-group-condensed',
+    moduleHeader: '.ig-header.header',
+    item: 'li.context_module_item',
+    itemRow: '.ig-row',
+    itemMenu: '.cog-menu-container .al-options',
+    itemKebab: '.cog-menu-container .al-trigger',
+    itemTitle: '.module-item-title .item_name .title, .module-item-title .item_name a, .module-item-title .title'
+  };
+
+  const CLASSES = {
+    checkboxCell: 'tm-bulk-checkbox-cell',
+    checkbox: 'tm-bulk-checkbox',
+    selectedRow: 'tm-bulk-selected-row',
+    actions: 'tm-bulk-actions',
+    actionButton: 'tm-bulk-action-btn',
+    actionDanger: 'tm-bulk-action-btn-danger',
+    actionCount: 'tm-bulk-action-count'
+  };
+
+  const ACTIONS = [
+    { key: 'duplicate', label: 'Duplicate', selector: 'a.duplicate_item_link', mode: 'duplicate' },
+    { key: 'outdent', label: 'Decrease indent', selector: 'a.outdent_item_link', mode: 'indent' },
+    { key: 'indent', label: 'Increase indent', selector: 'a.indent_item_link', mode: 'indent' },
+    { key: 'remove', label: 'Remove', selector: 'a.delete_item_link', mode: 'remove', danger: true }
+  ];
+
+  function log(...args) {
+    if (CONFIG.debug) console.log('[Canvas Bulk]', ...args);
+  }
+
+  function $(selector, root = document) {
+    return root.querySelector(selector);
+  }
+
+  function $$(selector, root = document) {
+    return Array.from(root.querySelectorAll(selector));
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function isVisible(el) {
+    if (!el) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    return el.getClientRects().length > 0;
+  }
+
+  function debounce(fn, wait) {
+    let t = null;
+    return (...args) => {
+      clearTimeout(t);
+      t = setTimeout(() => fn(...args), wait);
+    };
+  }
+
+  function getVisibleModules() {
+    return $$(SEL.module)
+      .filter(isVisible)
+      .filter(m => !m.id.endsWith('_blank'));
+  }
+
+  function getVisibleItems(moduleEl) {
+    return $$(SEL.item, moduleEl)
+      .filter(isVisible)
+      .filter(li => li.id !== 'context_module_item_blank');
+  }
+
+  function getItemRow(itemEl) {
+    return $(SEL.itemRow, itemEl);
+  }
+
+  function getItemTitle(itemEl) {
+    const el = $(SEL.itemTitle, itemEl);
+    return (el?.textContent || 'Untitled item').replace(/\s+/g, ' ').trim();
+  }
+
+  function getSelectedItems(moduleEl) {
+    return getVisibleItems(moduleEl).filter(item => {
+      const cb = item.querySelector(`.${CLASSES.checkbox}`);
+      return cb?.checked;
+    });
+  }
+
+  function getSourceAnchor(itemEl, selector) {
+    return itemEl.querySelector(`${SEL.itemMenu} ${selector}`);
+  }
+
+  function clickNative(el) {
+    if (!el) return;
+    el.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      view: window
+    }));
+    el.click();
+  }
+
+  async function waitUntil(fn, timeoutMs = 3000, intervalMs = 100) {
+    const end = Date.now() + timeoutMs;
+    while (Date.now() < end) {
+      if (fn()) return true;
+      await sleep(intervalMs);
+    }
+    return false;
+  }
+
+  function getIndentLevel(itemEl) {
+    const match = itemEl.className.match(/\bindent_(\d+)\b/);
+    return match ? Number(match[1]) : 0;
+  }
+
+  function canOutdent(itemEl) {
+    return getIndentLevel(itemEl) > 0;
+  }
+
+  function canIndent(itemEl) {
+    return getIndentLevel(itemEl) < 3;
+  }
+
+  function getItemType(itemEl) {
+    const hiddenType = itemEl.querySelector('.module_item_icons .type')?.textContent?.trim() || '';
+
+    if (itemEl.classList.contains('external_url')) return 'external_url';
+    if (itemEl.classList.contains('context_module_sub_header')) return 'context_module_sub_header';
+    if (itemEl.classList.contains('sub_header')) return 'context_module_sub_header';
+    if (itemEl.classList.contains('quiz')) return 'quiz';
+
+    if (hiddenType) return hiddenType;
+    return '';
+  }
+
+  function isDuplicateBlockedType(itemEl) {
+    const type = getItemType(itemEl);
+    return type === 'quiz' ||
+           type === 'external_url' ||
+           type === 'context_module_sub_header';
+  }
+
+  function isActionAvailable(itemEl, action) {
+    if (action.key === 'duplicate' && isDuplicateBlockedType(itemEl)) return false;
+    if (action.key === 'outdent' && !canOutdent(itemEl)) return false;
+    if (action.key === 'indent' && !canIndent(itemEl)) return false;
+
+    const a = getSourceAnchor(itemEl, action.selector);
+    if (!a) return false;
+
+    const li = a.closest('li');
+    if (!li) return false;
+    if (li.hidden) return false;
+    if (li.classList.contains('hidden')) return false;
+    if (li.style.display === 'none') return false;
+
+    return true;
+  }
+
+  function getCSRFToken() {
+    return (
+      document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ||
+      document.querySelector('input[name="authenticity_token"]')?.value ||
+      ''
+    );
+  }
+
+  async function requestWithCSRF(url, method) {
+    const token = getCSRFToken();
+    const res = await fetch(url, {
+      method,
+      credentials: 'same-origin',
+      headers: {
+        'X-CSRF-Token': token,
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json, text/javascript, */*; q=0.01'
+      }
+    });
+    if (!res.ok) throw new Error(`${method} failed (${res.status})`);
+    return res;
+  }
+
+  async function removeItemFallback(url) {
+    await requestWithCSRF(url, 'DELETE');
+  }
+
+  async function duplicateItemFallback(url) {
+    await requestWithCSRF(url, 'POST');
+  }
+
+  async function openItemMenu(itemEl) {
+    const kebab = itemEl.querySelector(SEL.itemKebab);
+    if (!kebab) throw new Error(`No item menu trigger for "${getItemTitle(itemEl)}"`);
+    clickNative(kebab);
+    await sleep(80);
+  }
+
+  async function runIndentAction(itemEl, selector) {
+    const beforeIndent = getIndentLevel(itemEl);
+    await openItemMenu(itemEl);
+
+    const actionAnchor = getSourceAnchor(itemEl, selector);
+    if (!actionAnchor) throw new Error(`Missing indent action for "${getItemTitle(itemEl)}"`);
+
+    clickNative(actionAnchor);
+
+    const changed = await waitUntil(() => {
+      if (!document.contains(itemEl)) return false;
+      return getIndentLevel(itemEl) !== beforeIndent;
+    }, 2500, 100);
+
+    return { reload: !changed };
+  }
+
+  async function runRemoveAction(itemEl, moduleEl, selector) {
+    const beforeCount = getVisibleItems(moduleEl).length;
+    await openItemMenu(itemEl);
+
+    const actionAnchor = getSourceAnchor(itemEl, selector);
+    if (!actionAnchor) throw new Error(`Missing remove action for "${getItemTitle(itemEl)}"`);
+
+    clickNative(actionAnchor);
+
+    let removed = await waitUntil(() => {
+      return !document.contains(itemEl) || getVisibleItems(moduleEl).length < beforeCount;
+    }, 1800, 100);
+
+    if (!removed) {
+      await removeItemFallback(actionAnchor.href);
+      removed = await waitUntil(() => {
+        return !document.contains(itemEl) || getVisibleItems(moduleEl).length < beforeCount;
+      }, 1500, 100);
+    }
+
+    return { reload: !removed };
+  }
+
+  async function runDuplicateAction(itemEl, moduleEl, selector) {
+    const beforeCount = getVisibleItems(moduleEl).length;
+    await openItemMenu(itemEl);
+
+    const actionAnchor = getSourceAnchor(itemEl, selector);
+    if (!actionAnchor) throw new Error(`Missing duplicate action for "${getItemTitle(itemEl)}"`);
+
+    clickNative(actionAnchor);
+
+    let duplicated = await waitUntil(() => {
+      return getVisibleItems(moduleEl).length > beforeCount;
+    }, 1500, 100);
+
+    if (!duplicated) {
+      await duplicateItemFallback(actionAnchor.href);
+      duplicated = await waitUntil(() => {
+        return getVisibleItems(moduleEl).length > beforeCount;
+      }, 1500, 100);
+    }
+
+    return { reload: duplicated };
+  }
+
+  async function runNativeAction(itemEl, moduleEl, action) {
+    switch (action.mode) {
+      case 'indent':
+        return runIndentAction(itemEl, moduleEl, action.selector);
+      case 'remove':
+        return runRemoveAction(itemEl, moduleEl, action.selector);
+      case 'duplicate':
+        return runDuplicateAction(itemEl, moduleEl, action.selector);
+      default:
+        throw new Error(`Unknown action mode: ${action.mode}`);
+    }
+  }
+
+  async function runBulkAction(moduleEl, action) {
+    const items = getSelectedItems(moduleEl);
+    if (!items.length) return;
+
+    const failures = [];
+    let shouldReload = false;
+
+    if (action.key === 'remove') {
+      const ok = confirm(`Remove ${items.length} selected item(s) from this module?`);
+      if (!ok) return;
+    }
+
+    for (const itemEl of items) {
+      try {
+        const result = await runNativeAction(itemEl, moduleEl, action);
+        if (result?.reload) shouldReload = true;
+      } catch (err) {
+        console.error(err);
+        failures.push(`${getItemTitle(itemEl)} — ${err.message}`);
+      }
+
+      await sleep(CONFIG.actionDelayMs);
+    }
+
+    refreshUI();
+
+    if (shouldReload) {
+      window.location.reload();
+      return;
+    }
+
+    if (failures.length) {
+      alert(
+        `Finished with ${failures.length} issue(s):\n\n` +
+        failures.map(x => `• ${x}`).join('\n')
+      );
+    }
+  }
+
+  function clearSelections(moduleEl) {
+    getVisibleItems(moduleEl).forEach(itemEl => {
+      const cb = itemEl.querySelector(`.${CLASSES.checkbox}`);
+      const row = getItemRow(itemEl);
+      if (cb) cb.checked = false;
+      if (row) row.classList.remove(CLASSES.selectedRow);
+    });
+    updateModuleUI(moduleEl);
+  }
+
+  function injectStyles() {
+    if (document.getElementById('tm-bulk-style')) return;
+
+    const style = document.createElement('style');
+    style.id = 'tm-bulk-style';
+    style.textContent = `
+      .context_module .ig-header.header {
+        flex-wrap: wrap !important;
+        overflow: visible !important;
+      }
+
+      .${CLASSES.checkboxCell} {
+        width: 26px;
+        min-width: 26px;
+        max-width: 26px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 26px;
+        margin-right: 2px;
+      }
+
+      .${CLASSES.checkbox} {
+        width: 18px;
+        height: 18px;
+        margin: 0;
+        cursor: pointer;
+      }
+
+      .context_module_item .ig-row.${CLASSES.selectedRow} {
+        background: rgba(17,45,84,0.06) !important;
+        box-shadow: inset 4px 0 0 #0f9d58;
+      }
+
+      .${CLASSES.actions} {
+        display: none;
+        position: relative;
+        align-items: center;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        gap: 10px;
+        flex: 0 0 100%;
+        width: 100%;
+        order: 999;
+        margin-top: 10px;
+        padding-top: 10px;
+        padding-right: 8px;
+        border-top: none;
+        overflow: visible;
+        box-sizing: border-box;
+      }
+
+      .${CLASSES.actions}::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -6px;
+        right: -6px;
+        border-top: 1px solid #c7cdd1;
+        pointer-events: none;
+      }
+
+      .${CLASSES.actionButton},
+      .${CLASSES.actionCount} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 34px;
+        padding: 0 16px;
+        border: 1px solid #c7cdd1;
+        border-radius: 999px;
+        background: #fff;
+        color: #2d3b45;
+        font-size: 14px;
+        line-height: 1;
+        white-space: nowrap;
+        box-sizing: border-box;
+      }
+
+      .${CLASSES.actionButton} {
+        cursor: pointer;
+      }
+
+      .${CLASSES.actionButton}:hover:not(:disabled) {
+        background: #f5f7fa;
+      }
+
+      .${CLASSES.actionButton}:disabled {
+        color: #9aa5ad;
+        background: #f8f9fa;
+        border-color: #d8dde1;
+        cursor: not-allowed;
+        opacity: 1;
+      }
+
+      .${CLASSES.actionButton}.${CLASSES.actionDanger} {
+        border-color: #d7b7b7;
+        color: #6b2c2c;
+      }
+
+      .${CLASSES.actionButton}.${CLASSES.actionDanger}:hover:not(:disabled) {
+        background: #fff7f7;
+      }
+
+      .${CLASSES.actionCount} {
+        background: #f5f7fa;
+        cursor: default;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function ensureCheckbox(itemEl) {
+    if (itemEl.dataset.tmBulkReady === '1') return;
+    itemEl.dataset.tmBulkReady = '1';
+
+    const row = getItemRow(itemEl);
+    if (!row) return;
+
+    const handle = row.querySelector('.ig-handle');
+
+    const cell = document.createElement('div');
+    cell.className = CLASSES.checkboxCell;
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = CLASSES.checkbox;
+    cb.title = `Select ${getItemTitle(itemEl)}`;
+
+    cb.addEventListener('click', (e) => {
+      e.stopPropagation();
+    });
+
+    cb.addEventListener('change', () => {
+      row.classList.toggle(CLASSES.selectedRow, cb.checked);
+      const moduleEl = itemEl.closest(SEL.module);
+      if (moduleEl) updateModuleUI(moduleEl);
+    });
+
+    cell.appendChild(cb);
+
+    if (handle && handle.nextSibling) {
+      row.insertBefore(cell, handle.nextSibling);
+    } else {
+      row.insertBefore(cell, row.firstChild);
+    }
+  }
+
+  function ensureActionBar(moduleEl) {
+    const header = $(SEL.moduleHeader, moduleEl);
+    if (!header) return null;
+
+    let bar = header.querySelector(`.${CLASSES.actions}`);
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.className = CLASSES.actions;
+      header.appendChild(bar);
+    }
+    return bar;
+  }
+
+  function makeActionButton(label, onClick, options = {}) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = CLASSES.actionButton;
+    btn.textContent = label;
+
+    if (options.danger) {
+      btn.classList.add(CLASSES.actionDanger);
+    }
+
+    if (options.disabled) {
+      btn.disabled = true;
+      btn.setAttribute('aria-disabled', 'true');
+      if (options.title) btn.title = options.title;
+      return btn;
+    }
+
+    btn.addEventListener('click', onClick);
+    return btn;
+  }
+
+  function renderActionBar(moduleEl) {
+    const bar = ensureActionBar(moduleEl);
+    if (!bar) return;
+
+    const selectedItems = getSelectedItems(moduleEl);
+
+    if (!selectedItems.length) {
+      bar.innerHTML = '';
+      bar.style.display = 'none';
+      return;
+    }
+
+    bar.innerHTML = '';
+    bar.style.display = 'flex';
+
+    for (const action of ACTIONS) {
+      const enabled = selectedItems.every(item => isActionAvailable(item, action));
+
+      let disabledTitle = '';
+      if (action.key === 'duplicate' && !enabled) {
+        disabledTitle = 'Duplicate is unavailable when the selection includes quizzes, text headers, external URLs, or other unsupported items.';
+      }
+
+      const btn = makeActionButton(
+        action.label,
+        async () => {
+          await runBulkAction(moduleEl, action);
+        },
+        {
+          disabled: !enabled,
+          danger: !!action.danger,
+          title: disabledTitle
+        }
+      );
+
+      bar.appendChild(btn);
+    }
+
+    const unselectBtn = makeActionButton('Unselect All', () => {
+      clearSelections(moduleEl);
+    });
+    bar.appendChild(unselectBtn);
+
+    const count = document.createElement('span');
+    count.className = CLASSES.actionCount;
+    count.textContent = `${selectedItems.length} selected`;
+    bar.appendChild(count);
+  }
+
+  function updateModuleUI(moduleEl) {
+    renderActionBar(moduleEl);
+  }
+
+  function refreshUI() {
+    getVisibleModules().forEach(moduleEl => {
+      getVisibleItems(moduleEl).forEach(ensureCheckbox);
+      ensureActionBar(moduleEl);
+      updateModuleUI(moduleEl);
+    });
+  }
+
+  function init() {
+    injectStyles();
+    refreshUI();
+
+    const observer = new MutationObserver(debounce(() => {
+      refreshUI();
+    }, 150));
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+
+    log('Initialized');
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
