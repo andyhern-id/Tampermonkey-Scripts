@@ -2,7 +2,7 @@
 // @name         Canvas | All Courses | Search Bar & Term Filter
 // @version      0.0.6
 // @description  Filters courses based on user input and term selection in course list page
-// @author       Daniel Victoriano <victoriano518@gmail.com> but then Alex took it and used Claude to make some changes. Andy came up with the filtering by term.
+// @author       Andy Hernandez
 // @match        https://*.instructure.com/courses
 // @grant        none
 // ==/UserScript==
