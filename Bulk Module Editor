@@ -1,9 +1,8 @@
 // ==UserScript==
 // @name         Canvas Bulk Item Actions (clean inline actions)
 // @namespace    https://tampermonkey.net/
-// @version      1.0.1
-// @author       Andy Hernandez
-// @description  Bulk actions for Canvas module items with inline action pills, unselect all, safe remove, and duplicate disabled for unsupported item types.
+// @version      1.1.0
+// @description  Bulk actions for Canvas module items with inline action pills, select all, unselect all, safe remove, and duplicate disabled for unsupported item types.
 // @match        https://*/courses/*/modules*
 // @match        http://*/courses/*/modules*
 // @grant        none
@@ -109,11 +108,6 @@
 
   function clickNative(el) {
     if (!el) return;
-    el.dispatchEvent(new MouseEvent('click', {
-      bubbles: true,
-      cancelable: true,
-      view: window
-    }));
     el.click();
   }
 
@@ -198,12 +192,20 @@
     return res;
   }
 
-  async function removeItemFallback(url) {
-    await requestWithCSRF(url, 'DELETE');
+  function isSafeModuleItemUrl(url) {
+    try {
+      const parsed = new URL(url, window.location.origin);
+      return /\/courses\/\d+\/modules\/items\/\d+(?:$|[/?#])/.test(parsed.pathname);
+    } catch {
+      return false;
+    }
   }
 
-  async function duplicateItemFallback(url) {
-    await requestWithCSRF(url, 'POST');
+  async function removeItemFallback(url) {
+    if (!isSafeModuleItemUrl(url)) {
+      throw new Error('Refusing unsafe remove URL');
+    }
+    await requestWithCSRF(url, 'DELETE');
   }
 
   async function openItemMenu(itemEl) {
@@ -225,32 +227,30 @@
     const changed = await waitUntil(() => {
       if (!document.contains(itemEl)) return false;
       return getIndentLevel(itemEl) !== beforeIndent;
-    }, 2500, 100);
+    }, 3000, 100);
 
     return { reload: !changed };
   }
 
   async function runRemoveAction(itemEl, moduleEl, selector) {
-    const beforeCount = getVisibleItems(moduleEl).length;
+    const actionTitle = getItemTitle(itemEl);
     await openItemMenu(itemEl);
 
     const actionAnchor = getSourceAnchor(itemEl, selector);
-    if (!actionAnchor) throw new Error(`Missing remove action for "${getItemTitle(itemEl)}"`);
+    if (!actionAnchor) throw new Error(`Missing remove action for "${actionTitle}"`);
 
-    clickNative(actionAnchor);
-
-    let removed = await waitUntil(() => {
-      return !document.contains(itemEl) || getVisibleItems(moduleEl).length < beforeCount;
-    }, 1800, 100);
-
-    if (!removed) {
-      await removeItemFallback(actionAnchor.href);
-      removed = await waitUntil(() => {
-        return !document.contains(itemEl) || getVisibleItems(moduleEl).length < beforeCount;
-      }, 1500, 100);
+    const removeUrl = actionAnchor.href;
+    if (!isSafeModuleItemUrl(removeUrl)) {
+      throw new Error(`Refusing unsafe remove target for "${actionTitle}"`);
     }
 
-    return { reload: !removed };
+    await removeItemFallback(removeUrl);
+
+    const row = getItemRow(itemEl);
+    if (row) row.remove();
+    else itemEl.remove();
+
+    return { reload: false };
   }
 
   async function runDuplicateAction(itemEl, moduleEl, selector) {
@@ -262,24 +262,17 @@
 
     clickNative(actionAnchor);
 
-    let duplicated = await waitUntil(() => {
+    await waitUntil(() => {
       return getVisibleItems(moduleEl).length > beforeCount;
-    }, 1500, 100);
+    }, 4000, 100);
 
-    if (!duplicated) {
-      await duplicateItemFallback(actionAnchor.href);
-      duplicated = await waitUntil(() => {
-        return getVisibleItems(moduleEl).length > beforeCount;
-      }, 1500, 100);
-    }
-
-    return { reload: duplicated };
+    return { reload: true };
   }
 
   async function runNativeAction(itemEl, moduleEl, action) {
     switch (action.mode) {
       case 'indent':
-        return runIndentAction(itemEl, moduleEl, action.selector);
+        return runIndentAction(itemEl, action.selector);
       case 'remove':
         return runRemoveAction(itemEl, moduleEl, action.selector);
       case 'duplicate':
@@ -297,7 +290,10 @@
     let shouldReload = false;
 
     if (action.key === 'remove') {
-      const ok = confirm(`Remove ${items.length} selected item(s) from this module?`);
+      const ok = confirm(
+        `Remove ${items.length} selected item(s) from this module only?\n\n` +
+        `This will NOT delete the underlying content from the course.`
+      );
       if (!ok) return;
     }
 
@@ -334,6 +330,16 @@
       const row = getItemRow(itemEl);
       if (cb) cb.checked = false;
       if (row) row.classList.remove(CLASSES.selectedRow);
+    });
+    updateModuleUI(moduleEl);
+  }
+
+  function selectAllItems(moduleEl) {
+    getVisibleItems(moduleEl).forEach(itemEl => {
+      const cb = itemEl.querySelector(`.${CLASSES.checkbox}`);
+      const row = getItemRow(itemEl);
+      if (cb) cb.checked = true;
+      if (row) row.classList.add(CLASSES.selectedRow);
     });
     updateModuleUI(moduleEl);
   }
@@ -534,6 +540,11 @@
 
     bar.innerHTML = '';
     bar.style.display = 'flex';
+
+    const selectAllBtn = makeActionButton('Select All', () => {
+      selectAllItems(moduleEl);
+    });
+    bar.appendChild(selectAllBtn);
 
     for (const action of ACTIONS) {
       const enabled = selectedItems.every(item => isActionAvailable(item, action));
